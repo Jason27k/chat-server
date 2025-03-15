@@ -26,7 +26,7 @@ This application is containerized using Docker and Docker Compose, which include
 1. Clone this repository:
 
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/Jason27k/chat-server
    cd <repository-directory>
    ```
 
