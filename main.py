@@ -1,5 +1,6 @@
 # server.py
 import json
+import base64
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -19,6 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
+import anthropic
 
 import fitz  # PyMuPDF
 import pymupdf4llm
@@ -32,6 +34,13 @@ DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:postgres@db:5432/chatapp"
+
+OPEN_AI_MODELS = ("o3-mini", "gpt-4o")
+DEEPSEEK_MODELS = ("deepseek-chat", "deepseek-reasoner")
+CLAUDE_MODELS = ("claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022")
+GEMINI_MODELS = ("gemini-2.0-flash",)
+
+IMAGE_MODELS = CLAUDE_MODELS + GEMINI_MODELS + ("gpt-4o",)
 
 # Database setup
 Base = declarative_base()
@@ -119,10 +128,11 @@ def get_deepseek_client():
 def get_claude_client():
     if not CLAUDE_API_KEY:
         raise ValueError("CLAUDE_API_KEY is not set in the environment variables.")
-
-    return OpenAI(
+    # return anthropic.Anthropic(
+    #     api_key="my_api_key",
+    # )
+    return anthropic.Anthropic(
         api_key=CLAUDE_API_KEY,  # Your Anthropic API key
-        base_url="https://api.anthropic.com/v1/",  # Anthropic's API endpoint
     )
 
 
@@ -163,18 +173,12 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Your React app's URL
+    allow_origins=["http://localhost:5173"],  # Your React app's URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Conversation-ID"],  # Expose our custom header
 )
-
-
-OPEN_AI_MODELS = ("o3-mini", "gpt-4o")
-DEEPSEEK_MODELS = ("deepseek-chat", "deepseek-reasoner")
-CLAUDE_MODELS = ("claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022")
-GEMINI_MODELS = ("gemini-2.0-flash",)
 
 # Supported file types for document processing
 CODE_EXTENSIONS = (
@@ -254,6 +258,7 @@ async def process_document(file: UploadFile = File(...), file_type: str = Form(.
 async def chat(
     model: str = Form(...),
     prompt: str = Form(...),
+    image: UploadFile = File(None),  # Optional image upload
     max_history: int = Form(10),  # Default limit of 10 messages
     conversation_id: int = Form(None),  # Optional conversation ID
 ):
@@ -269,6 +274,28 @@ async def chat(
     try:
         # Get database session
         db = SessionLocal()
+        print("model", model)
+
+        try:
+            # Get appropriate client
+            if model in OPEN_AI_MODELS:
+                client = get_openai_client()
+            elif model in DEEPSEEK_MODELS:
+                client = get_deepseek_client()
+            elif model in CLAUDE_MODELS:
+                client = get_claude_client()
+            elif model in GEMINI_MODELS:
+                client = get_gemini_client()
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported model")
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        if image and model not in IMAGE_MODELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model {model} does not support images. Supported models: {', '.join(IMAGE_MODELS)}",
+            )
 
         try:
             # If conversation_id is provided, load history from database
@@ -297,30 +324,22 @@ async def chat(
         finally:
             db.close()
 
-        # Add the current prompt
+        # Add the current prompt to message history
         message_history.append({"role": "user", "content": prompt})
 
-        try:
-            # Get appropriate client
-            if model in OPEN_AI_MODELS:
-                client = get_openai_client()
-            elif model in DEEPSEEK_MODELS:
-                client = get_deepseek_client()
-            elif model in CLAUDE_MODELS:
-                client = get_claude_client()
-            elif model in GEMINI_MODELS:
-                client = get_gemini_client()
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported model")
-        except ValueError as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        # Prepare messages with image if provided
+        messages_for_api = []
 
-        # Create completion with history
-        openai_response = client.chat.completions.create(
-            model=model,
-            messages=message_history,
-            stream=True,
-        )
+        # Process image if provided
+        image_content = None
+        image_bytes = None
+        image_base64 = None
+
+        if image:
+            image_bytes = await image.read()
+            image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+            # Store image content for database
+            image_content = f"[Image: {image.filename}]"
 
         # Save to database
         db = SessionLocal()
@@ -345,10 +364,14 @@ async def chat(
                 db.refresh(conversation)
 
             # Save user message
+            user_message_content = prompt
+            if image_content:
+                user_message_content = f"{prompt}\n{image_content}"
+
             user_message = Message(
                 conversation_id=conversation.id,
                 role="user",
-                content=prompt,
+                content=user_message_content,
                 model=model,
             )
             db.add(user_message)
@@ -362,37 +385,148 @@ async def chat(
         # Collect the full response while streaming
         full_response = ""
 
-        async def stream_with_save():
-            nonlocal full_response
-            for chunk in openai_response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    full_response += content
-                    yield f"data: {content}\n\n"
+        # Handle different model APIs
+        if model in CLAUDE_MODELS:
+            # Format messages for Claude API
+            if image:
+                # Claude format with image
+                claude_messages = []
 
-            # Save assistant's response to database
-            db = SessionLocal()
-            try:
-                assistant_message = Message(
-                    conversation_id=conversation_id,
-                    role="assistant",
-                    content=full_response,
-                    model=model,
+                # Add previous messages
+                for msg in message_history[:-1]:
+                    claude_messages.append(
+                        {"role": msg["role"], "content": msg["content"]}
+                    )
+
+                # Add current message with image
+                claude_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": image.content_type,
+                                    "data": image_base64,
+                                },
+                            },
+                        ],
+                    }
+                ]
+            else:
+                # Claude format without image
+                claude_messages = [
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in message_history
+                ]
+
+            # Create Claude stream
+            claude_stream = client.messages.stream(
+                model=model,
+                messages=claude_messages,
+                max_tokens=4000,
+            )
+
+            async def stream_claude_with_save():
+                nonlocal full_response
+                with claude_stream as stream:
+                    for text in stream.text_stream:
+                        full_response += text
+                        print("content", text)
+                        yield f"{text}"
+
+                # Save assistant's response to database
+                db = SessionLocal()
+                try:
+                    assistant_message = Message(
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=full_response,
+                        model=model,
+                    )
+                    db.add(assistant_message)
+                    db.commit()
+                finally:
+                    db.close()
+
+                yield "[DONE]\n\n"
+
+            # Return Claude streaming response
+            response = StreamingResponse(
+                stream_claude_with_save(), media_type="text/event-stream"
+            )
+            response.headers["X-Conversation-ID"] = str(conversation_id)
+            return response
+
+        else:
+            # Handle OpenAI-compatible APIs (OpenAI, Deepseek, Gemini)
+            if image:
+                # OpenAI format
+                for msg in message_history[:-1]:  # All previous messages
+                    messages_for_api.append(
+                        {"role": msg["role"], "content": msg["content"]}
+                    )
+
+                # Add the current message with image
+                messages_for_api.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/{image.content_type};base64,{image_base64}"
+                                },
+                            },
+                        ],
+                    }
                 )
-                db.add(assistant_message)
-                db.commit()
-            finally:
-                db.close()
+            else:
+                # No image, just use the regular message history
+                messages_for_api = message_history
 
-            yield "data: [DONE]\n\n"
+            # Create completion with history
+            openai_response = client.chat.completions.create(
+                model=model,
+                messages=messages_for_api,
+                stream=True,
+            )
 
-        # Handle streaming response
-        response = StreamingResponse(stream_with_save(), media_type="text/event-stream")
+            async def stream_with_save():
+                nonlocal full_response
+                for chunk in openai_response:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        full_response += content
+                        print("content", content)
+                        yield f"{content}"
 
-        # Add conversation_id to response headers - this is the primary way for clients to get the conversation ID
-        response.headers["X-Conversation-ID"] = str(conversation_id)
+                # Save assistant's response to database
+                db = SessionLocal()
+                try:
+                    assistant_message = Message(
+                        conversation_id=conversation_id,
+                        role="assistant",
+                        content=full_response,
+                        model=model,
+                    )
+                    db.add(assistant_message)
+                    db.commit()
+                finally:
+                    db.close()
 
-        return response
+                yield "[DONE]\n\n"
+
+            # Handle streaming response
+            response = StreamingResponse(
+                stream_with_save(), media_type="text/event-stream"
+            )
+            response.headers["X-Conversation-ID"] = str(conversation_id)
+            return response
+
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON format for history")
     except Exception as e:
